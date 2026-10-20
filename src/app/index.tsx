@@ -1,13 +1,22 @@
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { Spacing } from '@/constants/theme';
+import {
+  DEFAULT_CITY,
+  geocodeCity,
+  getWeather,
+  getWeatherEmoji,
+  mapToWeatherUI,
+  REFRESH_INTERVAL_MS,
+  type WeatherUIData,
+} from '@/services/weather';
 
 // ═══════════════════════════════════════════════════════════════════
-//  DEMO / DUMMY DATA — all in one place, easy to replace with
-//  real Firebase or ESP32 data later.
-//  ⚠️  Motor and Weather are intentionally separate objects.
-//      Weather must NEVER affect motor status.
+//  DEMO / DUMMY DATA — Motor & Soil are still dummy (ESP32 later).
+//  ⚠️  Motor and Weather are intentionally separate.
+//      Weather NEVER affects motor status.
 // ═══════════════════════════════════════════════════════════════════
 const DEMO_DATA = {
   // ── Motor (comes from ESP32 / Firebase) ──
@@ -20,24 +29,6 @@ const DEMO_DATA = {
   // ── Soil moisture (comes from ESP32 sensor) ──
   soil: {
     percentage: 28,                  // 0–100 %
-  },
-
-  // ── Weather (comes from weather API, display-only) ──
-  weather: {
-    temperature: 32,                 // °C
-    condition: 'Partly Cloudy',
-    humidity: 65,                    // %
-    windSpeed: 12,                   // km/h
-    chanceOfRain: 20,                // %
-    feelsLike: 35,                   // °C
-    location: 'Pune, Maharashtra',
-    lastUpdated: '20 Oct 2026, 11:45 AM',
-  },
-
-  // ── Sunrise / Sunset ──
-  sun: {
-    sunrise: '6:34 AM',
-    sunset: '5:58 PM',
   },
 };
 
@@ -52,8 +43,70 @@ function getSoilStatus(pct: number) {
 //  HOME SCREEN
 // ═══════════════════════════════════════════════════════════════════
 export default function HomeScreen() {
-  const { motor, soil, weather, sun } = DEMO_DATA;
+  const { motor, soil } = DEMO_DATA;
   const soilStatus = getSoilStatus(soil.percentage);
+
+  // ── Weather state (LIVE from OpenWeatherMap) ──
+  const [weather, setWeather] = useState<WeatherUIData | null>(null);
+  const [weatherLoading, setWeatherLoading] = useState(true);
+  const [weatherError, setWeatherError] = useState<string | null>(null);
+
+  // Keep a ref to the interval so we can clean it up
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // The city to fetch weather for (easy to change later)
+  const city = DEFAULT_CITY;
+
+  // ── Fetch weather data ──
+  const fetchWeather = useCallback(async () => {
+    try {
+      setWeatherLoading(true);
+      setWeatherError(null);
+
+      // 1. Geocode the city → lat/lon
+      const geo = await geocodeCity(city);
+
+      // 2. Fetch current weather + forecast
+      const raw = await getWeather(geo.lat, geo.lon);
+
+      // 3. Map to the shape our UI expects
+      const mapped = mapToWeatherUI(raw, geo.displayName);
+      setWeather(mapped);
+    } catch (err: any) {
+      // Show a friendly message but keep last successful data
+      setWeatherError(err?.message ?? 'Failed to load weather.');
+    } finally {
+      setWeatherLoading(false);
+    }
+  }, [city]);
+
+  // ── Fetch on mount + refresh every 10 minutes ──
+  useEffect(() => {
+    fetchWeather();
+
+    intervalRef.current = setInterval(fetchWeather, REFRESH_INTERVAL_MS);
+
+    // Cleanup on unmount
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [fetchWeather]);
+
+  // ── Derive display values ──
+  // If we have live data use it; otherwise show placeholder dashes
+  const w = weather ?? {
+    temperature: '--',
+    feelsLike: '--',
+    humidity: '--',
+    windSpeed: '--',
+    condition: '—',
+    iconCode: '01d',
+    chanceOfRain: '--',
+    location: 'Loading…',
+    sunrise: '--:--',
+    sunset: '--:--',
+    lastUpdated: '—',
+  };
 
   return (
     <View style={styles.screen}>
@@ -76,10 +129,10 @@ export default function HomeScreen() {
           </View>
 
           {/* ───────────────────────────────────────────
-              2. DEMO DATA PILL
+              2. DEMO DATA PILL (motor & soil are still demo)
              ─────────────────────────────────────────── */}
           <View style={styles.demoPill}>
-            <Text style={styles.demoPillText}>⚠️  DEMO DATA</Text>
+            <Text style={styles.demoPillText}>⚠️  DEMO DATA (Motor & Soil)</Text>
           </View>
 
           {/* ───────────────────────────────────────────
@@ -199,7 +252,7 @@ export default function HomeScreen() {
           </View>
 
           {/* ───────────────────────────────────────────
-              5. CURRENT WEATHER CARD
+              5. CURRENT WEATHER CARD (LIVE DATA)
              ─────────────────────────────────────────── */}
           <View style={[styles.card, styles.weatherCard]}>
             {/* Title row + refresh */}
@@ -211,53 +264,72 @@ export default function HomeScreen() {
               <Text style={styles.refreshIcon}>🔄</Text>
             </View>
 
-            {/* Location */}
-            <Text style={styles.location}>📍 {weather.location}</Text>
+            {/* Error banner (if any) */}
+            {weatherError && (
+              <View style={styles.errorBanner}>
+                <Text style={styles.errorText}>⚠️ {weatherError}</Text>
+              </View>
+            )}
 
-            {/* Big temperature + condition */}
-            <View style={styles.tempBlock}>
-              <Text style={styles.tempIcon}>☀️</Text>
-              <View>
-                <Text style={styles.tempValue}>{weather.temperature}°C</Text>
-                <Text style={styles.tempCondition}>{weather.condition}</Text>
+            {/* Loading spinner OR weather content */}
+            {weatherLoading && !weather ? (
+              <View style={styles.loadingBox}>
+                <ActivityIndicator size="large" color="#60A5FA" />
+                <Text style={styles.loadingText}>Fetching weather…</Text>
               </View>
-            </View>
+            ) : (
+              <>
+                {/* Location */}
+                <Text style={styles.location}>📍 {w.location}</Text>
 
-            {/* Divider */}
-            <View style={styles.divider} />
+                {/* Big temperature + condition */}
+                <View style={styles.tempBlock}>
+                  <Text style={styles.tempIcon}>
+                    {getWeatherEmoji(typeof w.iconCode === 'string' ? w.iconCode : '01d')}
+                  </Text>
+                  <View>
+                    <Text style={styles.tempValue}>{w.temperature}°C</Text>
+                    <Text style={styles.tempCondition}>{w.condition}</Text>
+                  </View>
+                </View>
 
-            {/* 2×2 grid: Humidity, Wind, Rain, Feels Like */}
-            <View style={styles.weatherGrid}>
-              <View style={styles.weatherGridItem}>
-                <Text style={styles.gridIcon}>💧</Text>
-                <Text style={styles.gridLabel}>Humidity</Text>
-                <Text style={styles.gridValue}>{weather.humidity}%</Text>
-              </View>
-              <View style={styles.weatherGridItem}>
-                <Text style={styles.gridIcon}>💨</Text>
-                <Text style={styles.gridLabel}>Wind</Text>
-                <Text style={styles.gridValue}>{weather.windSpeed} km/h</Text>
-              </View>
-              <View style={styles.weatherGridItem}>
-                <Text style={styles.gridIcon}>🌧️</Text>
-                <Text style={styles.gridLabel}>Chance of Rain</Text>
-                <Text style={styles.gridValue}>{weather.chanceOfRain}%</Text>
-              </View>
-              <View style={styles.weatherGridItem}>
-                <Text style={styles.gridIcon}>🌡️</Text>
-                <Text style={styles.gridLabel}>Feels Like</Text>
-                <Text style={styles.gridValue}>{weather.feelsLike}°C</Text>
-              </View>
-            </View>
+                {/* Divider */}
+                <View style={styles.divider} />
 
-            {/* Last updated */}
-            <Text style={styles.weatherTs}>
-              Last updated: {weather.lastUpdated}
-            </Text>
+                {/* 2×2 grid: Humidity, Wind, Rain, Feels Like */}
+                <View style={styles.weatherGrid}>
+                  <View style={styles.weatherGridItem}>
+                    <Text style={styles.gridIcon}>💧</Text>
+                    <Text style={styles.gridLabel}>Humidity</Text>
+                    <Text style={styles.gridValue}>{w.humidity}%</Text>
+                  </View>
+                  <View style={styles.weatherGridItem}>
+                    <Text style={styles.gridIcon}>💨</Text>
+                    <Text style={styles.gridLabel}>Wind</Text>
+                    <Text style={styles.gridValue}>{w.windSpeed} km/h</Text>
+                  </View>
+                  <View style={styles.weatherGridItem}>
+                    <Text style={styles.gridIcon}>🌧️</Text>
+                    <Text style={styles.gridLabel}>Chance of Rain</Text>
+                    <Text style={styles.gridValue}>{w.chanceOfRain}%</Text>
+                  </View>
+                  <View style={styles.weatherGridItem}>
+                    <Text style={styles.gridIcon}>🌡️</Text>
+                    <Text style={styles.gridLabel}>Feels Like</Text>
+                    <Text style={styles.gridValue}>{w.feelsLike}°C</Text>
+                  </View>
+                </View>
+
+                {/* Last updated */}
+                <Text style={styles.weatherTs}>
+                  Last updated: {w.lastUpdated}
+                </Text>
+              </>
+            )}
           </View>
 
           {/* ───────────────────────────────────────────
-              6. SUNRISE / SUNSET CARD
+              6. SUNRISE / SUNSET CARD (from weather API)
              ─────────────────────────────────────────── */}
           <View style={[styles.card, styles.sunCard]}>
             <View style={styles.sunRow}>
@@ -265,7 +337,9 @@ export default function HomeScreen() {
               <View style={styles.sunItem}>
                 <Text style={styles.sunIcon}>🌅</Text>
                 <Text style={styles.sunLabel}>Sunrise</Text>
-                <Text style={styles.sunTime}>{sun.sunrise}</Text>
+                <Text style={styles.sunTime}>
+                  {weather ? weather.sunrise : '--:--'}
+                </Text>
               </View>
 
               {/* Vertical separator */}
@@ -275,7 +349,9 @@ export default function HomeScreen() {
               <View style={styles.sunItem}>
                 <Text style={styles.sunIcon}>🌇</Text>
                 <Text style={styles.sunLabel}>Sunset</Text>
-                <Text style={styles.sunTime}>{sun.sunset}</Text>
+                <Text style={styles.sunTime}>
+                  {weather ? weather.sunset : '--:--'}
+                </Text>
               </View>
             </View>
           </View>
@@ -566,6 +642,28 @@ const styles = StyleSheet.create({
     fontSize: 12,
     textAlign: 'center',
     marginTop: 14,
+  },
+
+  // ── Weather loading & error states ──
+  loadingBox: {
+    alignItems: 'center',
+    paddingVertical: 30,
+    gap: 12,
+  },
+  loadingText: {
+    color: '#94A3B8',
+    fontSize: 14,
+  },
+  errorBanner: {
+    backgroundColor: '#7F1D1D',
+    borderRadius: 10,
+    padding: 10,
+    marginTop: 10,
+  },
+  errorText: {
+    color: '#FCA5A5',
+    fontSize: 13,
+    textAlign: 'center',
   },
 
   // ══════════ 6. SUNRISE / SUNSET CARD ══════════
